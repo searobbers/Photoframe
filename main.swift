@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import ImageIO
+import QuartzCore
 import UniformTypeIdentifiers
 
 private enum ExportFormat {
@@ -316,6 +317,59 @@ private extension NSShadow {
     }
 }
 
+final class ConfettiView: NSView {
+    private let emitter = CAEmitterLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        let tile: CGImage = {
+            let bitmap = CGContext(data: nil, width: 8, height: 14, bitsPerComponent: 8,
+                bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            bitmap.setFillColor(NSColor.white.cgColor)
+            bitmap.fill(CGRect(x: 0, y: 0, width: 8, height: 14))
+            return bitmap.makeImage()!
+        }()
+        let colors: [NSColor] = [.systemRed, .systemOrange, .systemYellow,
+                                 .systemGreen, .systemTeal, .systemPink]
+        emitter.emitterShape = .point
+        emitter.emitterMode = .points
+        emitter.emitterCells = colors.map { color in
+            let cell = CAEmitterCell()
+            cell.contents = tile
+            cell.color = color.cgColor
+            cell.birthRate = 35
+            cell.lifetime = 3.2
+            cell.lifetimeRange = 0.5
+            cell.velocity = 650
+            cell.velocityRange = 160
+            cell.yAcceleration = -750
+            cell.emissionLongitude = .pi / 2
+            cell.emissionRange = .pi / 3
+            cell.spin = 4
+            cell.spinRange = 5
+            cell.scale = 0.8
+            cell.scaleRange = 0.25
+            return cell
+        }
+        layer?.addSublayer(emitter)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        emitter.frame = bounds
+        emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.minY + 14)
+        emitter.emitterSize = .zero
+    }
+
+    func stop() { emitter.birthRate = 0 }
+}
+
 private final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let accent = NSColor(calibratedRed: 0.79, green: 0.31, blue: 0.18, alpha: 1)
     private let supportedExtensions: Set<String> = [
@@ -338,7 +392,8 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     private let canvasToggle = NSButton(checkboxWithTitle: "纯白色画布", target: nil, action: nil)
     private let canvasRatioButton = NSPopUpButton(frame: .zero, pullsDown: false)
     private let canvasSlider = NSSlider(value: 10, minValue: 0, maxValue: 50, target: nil, action: nil)
-    private let canvasValue = NSTextField(labelWithString: "10%")
+    private let canvasInput = NSTextField(string: "10")
+    private var confettiView: ConfettiView?
     private let optimizeToggle = NSButton(checkboxWithTitle: "小红书优化（最长边 ≤3500 像素，≤10 MB）", target: nil, action: nil)
     private let exportButton = NSButton(title: "导出照片", target: nil, action: nil)
     private let chooseFolderButton = NSButton(title: "选择文件夹", target: nil, action: nil)
@@ -365,7 +420,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         }
         optimizeToggle.state = UserDefaults.standard.object(forKey: optimizePreferenceKey) == nil
             || UserDefaults.standard.bool(forKey: optimizePreferenceKey) ? .on : .off
-        canvasChanged()
+        canvasChanged(nil)
         installMenu()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -540,19 +595,25 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         slider.action = #selector(borderChanged)
         slider.isContinuous = true
         canvasToggle.target = self
-        canvasToggle.action = #selector(canvasChanged)
+        canvasToggle.action = #selector(canvasChanged(_:))
         canvasToggle.font = .systemFont(ofSize: 12, weight: .medium)
         canvasRatioButton.addItems(withTitles: CanvasRatio.allCases.map(\.rawValue))
         canvasRatioButton.target = self
-        canvasRatioButton.action = #selector(canvasChanged)
+        canvasRatioButton.action = #selector(canvasChanged(_:))
         canvasRatioButton.setAccessibilityLabel("白色画布比例")
         let ratioHeading = label("比例", size: 12, color: .secondaryLabelColor)
         canvasSlider.target = self
-        canvasSlider.action = #selector(canvasChanged)
+        canvasSlider.action = #selector(canvasChanged(_:))
         canvasSlider.isContinuous = true
         canvasSlider.setAccessibilityLabel("白色画布留白，按照片短边百分比")
-        canvasValue.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        canvasValue.textColor = accent
+        canvasInput.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
+        canvasInput.textColor = accent
+        canvasInput.alignment = .right
+        canvasInput.delegate = self
+        canvasInput.target = self
+        canvasInput.action = #selector(canvasInputCommitted)
+        canvasInput.setAccessibilityLabel("画布留白，按照片短边百分比")
+        let canvasUnit = label("%", size: 13, weight: .medium, color: accent)
         optimizeToggle.target = self
         optimizeToggle.action = #selector(optimizeChanged)
         optimizeToggle.font = .systemFont(ofSize: 11)
@@ -563,7 +624,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         }
         for view in [heading, borderInput, percentUnit, zero, slider, max, canvasToggle,
                      ratioHeading, canvasRatioButton,
-                     canvasHeading, canvasSlider, canvasValue, optimizeToggle, statusLabel,
+                     canvasHeading, canvasSlider, canvasInput, canvasUnit, optimizeToggle, statusLabel,
                      outputHeading, outputPathLabel, chooseFolderButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             controls.addSubview(view)
@@ -599,11 +660,13 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             canvasHeading.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
             canvasHeading.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
             canvasSlider.leadingAnchor.constraint(equalTo: canvasHeading.trailingAnchor, constant: 16),
-            canvasSlider.trailingAnchor.constraint(equalTo: canvasValue.leadingAnchor, constant: -12),
+            canvasSlider.trailingAnchor.constraint(equalTo: canvasInput.leadingAnchor, constant: -12),
             canvasSlider.topAnchor.constraint(equalTo: canvasToggle.bottomAnchor, constant: 9),
-            canvasValue.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
-            canvasValue.widthAnchor.constraint(equalToConstant: 38),
-            canvasValue.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
+            canvasInput.trailingAnchor.constraint(equalTo: canvasUnit.leadingAnchor, constant: -5),
+            canvasInput.widthAnchor.constraint(equalToConstant: 58),
+            canvasInput.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
+            canvasUnit.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
+            canvasUnit.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
             optimizeToggle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
             optimizeToggle.topAnchor.constraint(equalTo: canvasSlider.bottomAnchor, constant: 9),
             statusLabel.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
@@ -749,25 +812,33 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     }
 
     func controlTextDidChange(_ notification: Notification) {
-        guard notification.object as? NSTextField === borderInput,
-              let value = enteredBorderValue() else { return }
-        applyBorder(value, updateInput: false)
+        guard let field = notification.object as? NSTextField else { return }
+        if field === borderInput, let value = enteredValue(in: field, maximum: 30) {
+            applyBorder(value, updateInput: false)
+        } else if field === canvasInput, let value = enteredValue(in: field, maximum: 50) {
+            applyCanvas(value, updateInput: false)
+        }
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        guard notification.object as? NSTextField === borderInput else { return }
-        borderInputCommitted()
+        guard let field = notification.object as? NSTextField else { return }
+        if field === borderInput { borderInputCommitted() }
+        if field === canvasInput { canvasInputCommitted() }
     }
 
     @objc private func borderInputCommitted() {
-        applyBorder(enteredBorderValue() ?? preview.borderPercent)
+        applyBorder(enteredValue(in: borderInput, maximum: 30) ?? preview.borderPercent)
     }
 
-    private func enteredBorderValue() -> Double? {
-        let text = borderInput.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    @objc private func canvasInputCommitted() {
+        applyCanvas(enteredValue(in: canvasInput, maximum: 50) ?? preview.canvasPercent)
+    }
+
+    private func enteredValue(in field: NSTextField, maximum: Double) -> Double? {
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: ",", with: ".")
         guard let value = Double(text), value.isFinite else { return nil }
-        return (min(max(value, 0), 30) * 100).rounded() / 100
+        return (min(max(value, 0), maximum) * 100).rounded() / 100
     }
 
     private func applyBorder(_ value: Double, updateInput: Bool = true) {
@@ -777,21 +848,27 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         UserDefaults.standard.set(value, forKey: borderPreferenceKey)
     }
 
-    @objc private func canvasChanged() {
+    @objc private func canvasChanged(_ sender: Any?) {
         let enabled = canvasToggle.state == .on
-        let value = (canvasSlider.doubleValue * 2).rounded() / 2
-        canvasSlider.doubleValue = value
-        canvasValue.stringValue = "\(value.formatted())%"
+        let value = sender as? NSSlider === canvasSlider
+            ? (canvasSlider.doubleValue * 2).rounded() / 2 : canvasSlider.doubleValue
+        applyCanvas(value)
         canvasSlider.isEnabled = enabled
+        canvasInput.isEnabled = enabled
         canvasRatioButton.isEnabled = enabled
         optimizeToggle.isHidden = !enabled
         preview.canvasEnabled = enabled
-        preview.canvasPercent = value
         let ratio = CanvasRatio(rawValue: canvasRatioButton.titleOfSelectedItem ?? "") ?? .square
         preview.canvasRatio = ratio
         UserDefaults.standard.set(enabled, forKey: canvasEnabledPreferenceKey)
-        UserDefaults.standard.set(value, forKey: canvasPreferenceKey)
         UserDefaults.standard.set(ratio.rawValue, forKey: canvasRatioPreferenceKey)
+    }
+
+    private func applyCanvas(_ value: Double, updateInput: Bool = true) {
+        canvasSlider.doubleValue = value
+        preview.canvasPercent = value
+        if updateInput { canvasInput.stringValue = String(value) }
+        UserDefaults.standard.set(value, forKey: canvasPreferenceKey)
     }
 
     @objc private func optimizeChanged() {
@@ -888,8 +965,29 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
                 self.statusLabel.stringValue = failures.isEmpty
                     ? "已导出 \(success) 张照片"
                     : "已导出 \(success) 张，失败 \(failures.count) 张"
-                if let first = failures.first { self.showError(first) }
+                if let first = failures.first {
+                    self.showError(first)
+                } else {
+                    self.showConfetti()
+                }
             }
+        }
+    }
+
+    private func showConfetti() {
+        guard let root = window.contentView else { return }
+        confettiView?.removeFromSuperview()
+        let effect = ConfettiView(frame: root.bounds)
+        effect.autoresizingMask = [.width, .height]
+        root.addSubview(effect, positioned: .above, relativeTo: nil)
+        confettiView = effect
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak effect] in
+            effect?.stop()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self, weak effect] in
+            guard let self, self.confettiView === effect else { return }
+            effect?.removeFromSuperview()
+            self.confettiView = nil
         }
     }
 

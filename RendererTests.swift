@@ -1,8 +1,27 @@
 import AppKit
 import ImageIO
+import QuartzCore
 import UniformTypeIdentifiers
 
 func runRendererTests() throws {
+    if CommandLine.arguments.contains("--preview-confetti") {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let window = NSWindow(contentRect: CGRect(x: 200, y: 150, width: 980, height: 650),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "彩带动画预览"
+        let background = NSView(frame: window.contentView!.bounds)
+        background.wantsLayer = true
+        background.layer?.backgroundColor = NSColor(calibratedWhite: 0.9, alpha: 1).cgColor
+        window.contentView = background
+        let effect = ConfettiView(frame: background.bounds)
+        effect.autoresizingMask = [.width, .height]
+        background.addSubview(effect)
+        window.makeKeyAndOrderFront(nil)
+        app.activate(ignoringOtherApps: true)
+        app.run()
+        return
+    }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -86,5 +105,14 @@ func runRendererTests() throws {
         FrameSettings(borderPercent: 8, canvasEnabled: false, canvasPercent: 10,
             canvasRatio: .square, optimizeForXiaohongshu: true))
     precondition(noCanvas.size.width == 3900 && noCanvas.size.height == 2900)
+    let confetti = ConfettiView(frame: CGRect(x: 0, y: 0, width: 980, height: 650))
+    confetti.layoutSubtreeIfNeeded()
+    let emitter = confetti.layer?.sublayers?.compactMap { $0 as? CAEmitterLayer }.first
+    precondition(emitter?.emitterCells?.count == 6)
+    precondition(emitter?.emitterShape == .point && emitter?.emitterMode == .points)
+    precondition(emitter?.emitterPosition.y == 14)
+    precondition(emitter?.emitterCells?.allSatisfy { $0.emissionLongitude == .pi / 2 && $0.yAcceleration < 0 } == true)
+    confetti.stop()
+    precondition(emitter?.birthRate == 0)
     print("Renderer tests passed: \(optimizedImage.width)x\(optimizedImage.height), \(fileSize) bytes")
 }

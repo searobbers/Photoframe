@@ -15,7 +15,7 @@ iconutil -c icns "$iconset" -o "$app/Contents/Resources/Photoframe.icns"
 swiftc -swift-version 5 -O -target arm64-apple-macos13.0 \
   -module-cache-path "$root/build/PhotoframeModuleCache" \
   -Xfrontend -downgrade-typecheck-interface-error \
-  -framework AppKit -framework CoreImage -framework ImageIO \
+  -framework AppKit -framework CoreImage -framework ImageIO -framework QuartzCore \
   -framework UniformTypeIdentifiers \
   "$root/main.swift" -o "$app/Contents/MacOS/Photoframe"
 codesign --force --sign - "$app"

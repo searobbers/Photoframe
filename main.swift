@@ -43,8 +43,69 @@ private enum FrameError: LocalizedError {
     }
 }
 
-private enum FrameRenderer {
-    static func render(source: URL, destination: URL, borderPercent: Double) throws {
+enum CanvasRatio: String, CaseIterable {
+    case square = "1:1", portraitFourFive = "4:5", portraitThreeFour = "3:4"
+    case portraitTwoThree = "2:3", portraitNineSixteen = "9:16"
+    case landscapeFiveFour = "5:4", landscapeFourThree = "4:3"
+    case landscapeThreeTwo = "3:2", landscapeSixteenNine = "16:9"
+    case original = "原图比例"
+
+    var components: (Int, Int)? {
+        switch self {
+        case .square: return (1, 1)
+        case .portraitFourFive: return (4, 5)
+        case .portraitThreeFour: return (3, 4)
+        case .portraitTwoThree: return (2, 3)
+        case .portraitNineSixteen: return (9, 16)
+        case .landscapeFiveFour: return (5, 4)
+        case .landscapeFourThree: return (4, 3)
+        case .landscapeThreeTwo: return (3, 2)
+        case .landscapeSixteenNine: return (16, 9)
+        case .original: return nil
+        }
+    }
+}
+
+struct FrameSettings {
+    let borderPercent: Double
+    let canvasEnabled: Bool
+    let canvasPercent: Double
+    let canvasRatio: CanvasRatio
+    let optimizeForXiaohongshu: Bool
+
+    var optimized: Bool { canvasEnabled && optimizeForXiaohongshu }
+}
+
+struct FrameGeometry {
+    let photo: CGRect
+    let frame: CGRect
+    let size: CGSize
+    let ratio: (Int, Int)?
+
+    init(width: CGFloat, height: CGFloat, settings: FrameSettings) {
+        let shortSide = min(width, height)
+        let border = (shortSide * settings.borderPercent / 100).rounded()
+        let canvas = settings.canvasEnabled ? (shortSide * settings.canvasPercent / 100).rounded() : 0
+        let frameWidth = width + border * 2
+        let frameHeight = height + border * 2
+        let minimumWidth = frameWidth + canvas * 2
+        let minimumHeight = frameHeight + canvas * 2
+        ratio = settings.canvasEnabled ? settings.canvasRatio.components : nil
+        if let ratio {
+            let unit = ceil(max(minimumWidth / CGFloat(ratio.0), minimumHeight / CGFloat(ratio.1)))
+            size = CGSize(width: unit * CGFloat(ratio.0), height: unit * CGFloat(ratio.1))
+        } else {
+            size = CGSize(width: minimumWidth, height: minimumHeight)
+        }
+        let origin = CGPoint(x: ((size.width - frameWidth) / 2).rounded(.down),
+            y: ((size.height - frameHeight) / 2).rounded(.down))
+        frame = CGRect(origin: origin, size: CGSize(width: frameWidth, height: frameHeight))
+        photo = CGRect(x: origin.x + border, y: origin.y + border, width: width, height: height)
+    }
+}
+
+enum FrameRenderer {
+    static func render(source: URL, destination: URL, settings: FrameSettings) throws {
         guard let input = CIImage(contentsOf: source, options: [.applyOrientationProperty: true]) else {
             throw FrameError.unreadable(source.lastPathComponent)
         }
@@ -53,28 +114,15 @@ private enum FrameRenderer {
             throw FrameError.unreadable(source.lastPathComponent)
         }
 
-        let inset = Int((Double(min(image.width, image.height)) * borderPercent / 100).rounded())
-        let width = image.width + inset * 2
-        let height = image.height + inset * 2
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
+        let geometry = FrameGeometry(width: CGFloat(image.width), height: CGFloat(image.height), settings: settings)
+        let format: ExportFormat = settings.optimized ? .jpeg : ExportFormat(source: source)
+        if settings.optimized {
+            try writeOptimized(image: image, geometry: geometry, destination: destination)
+            return
+        }
+        guard let output = draw(image: image, geometry: geometry, scale: 1) else {
             throw FrameError.renderFailed(source.lastPathComponent)
         }
-        context.setFillColor(NSColor.black.cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(image, in: CGRect(x: inset, y: inset, width: image.width, height: image.height))
-        guard let output = context.makeImage() else {
-            throw FrameError.renderFailed(source.lastPathComponent)
-        }
-
-        let format = ExportFormat(source: source)
         guard let writer = CGImageDestinationCreateWithURL(
             destination as CFURL, format.contentType.identifier as CFString, 1, nil
         ) else {
@@ -86,6 +134,63 @@ private enum FrameRenderer {
         CGImageDestinationAddImage(writer, output, options)
         guard CGImageDestinationFinalize(writer) else {
             throw FrameError.writeFailed(destination.lastPathComponent)
+        }
+    }
+
+    private static func draw(image: CGImage, geometry: FrameGeometry, scale: CGFloat) -> CGImage? {
+        var width = max(1, Int((geometry.size.width * scale).rounded()))
+        var height = max(1, Int((geometry.size.height * scale).rounded()))
+        if let ratio = geometry.ratio {
+            let unit = max(1, min(width / ratio.0, height / ratio.1))
+            width = unit * ratio.0
+            height = unit * ratio.1
+        }
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.scaleBy(x: CGFloat(width) / geometry.size.width, y: CGFloat(height) / geometry.size.height)
+        if geometry.frame.minX > 0 {
+            context.setFillColor(NSColor.white.cgColor)
+            context.fill(CGRect(origin: .zero, size: geometry.size))
+        }
+        context.setFillColor(NSColor.black.cgColor)
+        context.fill(geometry.frame)
+        context.draw(image, in: geometry.photo)
+        return context.makeImage()
+    }
+
+    private static func writeOptimized(image: CGImage, geometry: FrameGeometry, destination: URL) throws {
+        let maxBytes = 10_000_000
+        var scale = min(1, 3500 / max(geometry.size.width, geometry.size.height))
+        while true {
+            guard let output = draw(image: image, geometry: geometry, scale: scale) else {
+                throw FrameError.renderFailed(destination.lastPathComponent)
+            }
+            for quality in [0.90, 0.78, 0.65, 0.50, 0.35] {
+                let buffer = NSMutableData()
+                guard let writer = CGImageDestinationCreateWithData(
+                    buffer, UTType.jpeg.identifier as CFString, 1, nil
+                ) else { throw FrameError.writeFailed(destination.lastPathComponent) }
+                CGImageDestinationAddImage(writer, output,
+                    [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+                guard CGImageDestinationFinalize(writer) else {
+                    throw FrameError.writeFailed(destination.lastPathComponent)
+                }
+                if buffer.length <= maxBytes {
+                    try (buffer as Data).write(to: destination, options: .atomic)
+                    return
+                }
+            }
+            if output.width == 1 && output.height == 1 {
+                throw FrameError.writeFailed(destination.lastPathComponent)
+            }
+            scale *= 0.8
         }
     }
 }
@@ -142,6 +247,9 @@ private final class DropView: NSView {
 private final class PreviewView: NSView {
     var image: NSImage? { didSet { needsDisplay = true } }
     var borderPercent = 8.0 { didSet { needsDisplay = true } }
+    var canvasEnabled = false { didSet { needsDisplay = true } }
+    var canvasPercent = 10.0 { didSet { needsDisplay = true } }
+    var canvasRatio = CanvasRatio.square { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedRed: 0.89, green: 0.91, blue: 0.89, alpha: 1).setFill()
@@ -152,8 +260,11 @@ private final class PreviewView: NSView {
         }
         let photoSize = image.size
         guard photoSize.width > 0, photoSize.height > 0 else { return }
-        let inset = min(photoSize.width, photoSize.height) * borderPercent / 100
-        let outerSize = NSSize(width: photoSize.width + inset * 2, height: photoSize.height + inset * 2)
+        let geometry = FrameGeometry(width: photoSize.width, height: photoSize.height,
+            settings: FrameSettings(borderPercent: borderPercent, canvasEnabled: canvasEnabled,
+                canvasPercent: canvasPercent, canvasRatio: canvasRatio,
+                optimizeForXiaohongshu: false))
+        let outerSize = geometry.size
         let available = bounds.insetBy(dx: 34, dy: 34)
         let scale = min(available.width / outerSize.width, available.height / outerSize.height)
         let outer = NSRect(
@@ -167,10 +278,18 @@ private final class PreviewView: NSView {
             $0.shadowBlurRadius = 22
             $0.shadowOffset = NSSize(width: 0, height: -8)
         }
-        NSColor.black.setFill()
+        (canvasEnabled ? NSColor.white : NSColor.black).setFill()
         outer.fill()
         NSShadow().set()
-        let photo = outer.insetBy(dx: inset * scale, dy: inset * scale)
+        if canvasEnabled {
+            NSColor.black.setFill()
+            CGRect(x: outer.minX + geometry.frame.minX * scale,
+                y: outer.minY + geometry.frame.minY * scale,
+                width: geometry.frame.width * scale, height: geometry.frame.height * scale).fill()
+        }
+        let photo = CGRect(x: outer.minX + geometry.photo.minX * scale,
+            y: outer.minY + geometry.photo.minY * scale,
+            width: geometry.photo.width * scale, height: geometry.photo.height * scale)
         image.draw(in: photo, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
     }
 
@@ -216,9 +335,18 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     private let statusLabel = NSTextField(labelWithString: "每边宽度按照片短边计算")
     private let outputPathLabel = NSTextField(labelWithString: "导入照片后确定导出位置")
     private let slider = NSSlider(value: 8, minValue: 0, maxValue: 30, target: nil, action: nil)
+    private let canvasToggle = NSButton(checkboxWithTitle: "纯白色画布", target: nil, action: nil)
+    private let canvasRatioButton = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let canvasSlider = NSSlider(value: 10, minValue: 0, maxValue: 50, target: nil, action: nil)
+    private let canvasValue = NSTextField(labelWithString: "10%")
+    private let optimizeToggle = NSButton(checkboxWithTitle: "小红书优化（最长边 ≤3500 像素，≤10 MB）", target: nil, action: nil)
     private let exportButton = NSButton(title: "导出照片", target: nil, action: nil)
     private let chooseFolderButton = NSButton(title: "选择文件夹", target: nil, action: nil)
     private let borderPreferenceKey = "borderPercent"
+    private let canvasPreferenceKey = "canvasPercent"
+    private let canvasEnabledPreferenceKey = "canvasEnabled"
+    private let canvasRatioPreferenceKey = "canvasRatio"
+    private let optimizePreferenceKey = "optimizeForXiaohongshu"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let iconURL = Bundle.main.url(forResource: "Photoframe", withExtension: "icns"),
@@ -230,6 +358,14 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             slider.doubleValue = min(max(saved.doubleValue, 0), 30)
             borderChanged()
         }
+        canvasToggle.state = UserDefaults.standard.bool(forKey: canvasEnabledPreferenceKey) ? .on : .off
+        canvasRatioButton.selectItem(withTitle: UserDefaults.standard.string(forKey: canvasRatioPreferenceKey) ?? CanvasRatio.square.rawValue)
+        if let saved = UserDefaults.standard.object(forKey: canvasPreferenceKey) as? NSNumber {
+            canvasSlider.doubleValue = min(max(saved.doubleValue, 0), 50)
+        }
+        optimizeToggle.state = UserDefaults.standard.object(forKey: optimizePreferenceKey) == nil
+            || UserDefaults.standard.bool(forKey: optimizePreferenceKey) ? .on : .off
+        canvasChanged()
         installMenu()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -245,7 +381,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         )
         window.title = "Photoframe · 黑边相框"
         window.center()
-        window.minSize = NSSize(width: 780, height: 560)
+        window.minSize = NSSize(width: 780, height: 620)
 
         let root = DropView(frame: .zero)
         root.wantsLayer = true
@@ -290,7 +426,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             controls.leadingAnchor.constraint(equalTo: main.leadingAnchor),
             controls.trailingAnchor.constraint(equalTo: main.trailingAnchor),
             controls.bottomAnchor.constraint(equalTo: main.bottomAnchor),
-            controls.heightAnchor.constraint(equalToConstant: 158)
+            controls.heightAnchor.constraint(equalToConstant: 244)
         ])
 
         buildHeader(header)
@@ -403,11 +539,32 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         slider.target = self
         slider.action = #selector(borderChanged)
         slider.isContinuous = true
+        canvasToggle.target = self
+        canvasToggle.action = #selector(canvasChanged)
+        canvasToggle.font = .systemFont(ofSize: 12, weight: .medium)
+        canvasRatioButton.addItems(withTitles: CanvasRatio.allCases.map(\.rawValue))
+        canvasRatioButton.target = self
+        canvasRatioButton.action = #selector(canvasChanged)
+        canvasRatioButton.setAccessibilityLabel("白色画布比例")
+        let ratioHeading = label("比例", size: 12, color: .secondaryLabelColor)
+        canvasSlider.target = self
+        canvasSlider.action = #selector(canvasChanged)
+        canvasSlider.isContinuous = true
+        canvasSlider.setAccessibilityLabel("白色画布留白，按照片短边百分比")
+        canvasValue.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        canvasValue.textColor = accent
+        optimizeToggle.target = self
+        optimizeToggle.action = #selector(optimizeChanged)
+        optimizeToggle.font = .systemFont(ofSize: 11)
+        let canvasHeading = label("画布留白", size: 12, weight: .medium)
         for view in [selectedName, dimensions] {
             view.translatesAutoresizingMaskIntoConstraints = false
             main.addSubview(view)
         }
-        for view in [heading, borderInput, percentUnit, zero, slider, max, statusLabel, outputHeading, outputPathLabel, chooseFolderButton] {
+        for view in [heading, borderInput, percentUnit, zero, slider, max, canvasToggle,
+                     ratioHeading, canvasRatioButton,
+                     canvasHeading, canvasSlider, canvasValue, optimizeToggle, statusLabel,
+                     outputHeading, outputPathLabel, chooseFolderButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             controls.addSubview(view)
         }
@@ -418,7 +575,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             dimensions.trailingAnchor.constraint(equalTo: main.trailingAnchor, constant: -24),
             dimensions.centerYAnchor.constraint(equalTo: selectedName.centerYAnchor),
             heading.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 26),
-            heading.topAnchor.constraint(equalTo: controls.topAnchor, constant: 19),
+            heading.topAnchor.constraint(equalTo: controls.topAnchor, constant: 13),
             percentUnit.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -26),
             percentUnit.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
             borderInput.trailingAnchor.constraint(equalTo: percentUnit.leadingAnchor, constant: -5),
@@ -428,19 +585,37 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             zero.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
             slider.leadingAnchor.constraint(equalTo: zero.trailingAnchor, constant: 12),
             slider.trailingAnchor.constraint(equalTo: max.leadingAnchor, constant: -12),
-            slider.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 14),
+            slider.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 9),
             max.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
             max.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            canvasToggle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            canvasToggle.topAnchor.constraint(equalTo: slider.bottomAnchor, constant: 9),
+            ratioHeading.trailingAnchor.constraint(equalTo: canvasRatioButton.leadingAnchor, constant: -8),
+            ratioHeading.centerYAnchor.constraint(equalTo: canvasRatioButton.centerYAnchor),
+            canvasRatioButton.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
+            canvasRatioButton.centerYAnchor.constraint(equalTo: canvasToggle.centerYAnchor),
+            canvasRatioButton.widthAnchor.constraint(equalToConstant: 118),
+            canvasToggle.trailingAnchor.constraint(lessThanOrEqualTo: ratioHeading.leadingAnchor, constant: -8),
+            canvasHeading.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            canvasHeading.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
+            canvasSlider.leadingAnchor.constraint(equalTo: canvasHeading.trailingAnchor, constant: 16),
+            canvasSlider.trailingAnchor.constraint(equalTo: canvasValue.leadingAnchor, constant: -12),
+            canvasSlider.topAnchor.constraint(equalTo: canvasToggle.bottomAnchor, constant: 9),
+            canvasValue.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
+            canvasValue.widthAnchor.constraint(equalToConstant: 38),
+            canvasValue.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
+            optimizeToggle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            optimizeToggle.topAnchor.constraint(equalTo: canvasSlider.bottomAnchor, constant: 9),
             statusLabel.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: controls.trailingAnchor, constant: -26),
-            statusLabel.topAnchor.constraint(equalTo: slider.bottomAnchor, constant: 9),
+            statusLabel.topAnchor.constraint(equalTo: optimizeToggle.bottomAnchor, constant: 8),
             outputHeading.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
             outputHeading.centerYAnchor.constraint(equalTo: chooseFolderButton.centerYAnchor),
             outputPathLabel.leadingAnchor.constraint(equalTo: outputHeading.trailingAnchor, constant: 10),
             outputPathLabel.trailingAnchor.constraint(equalTo: chooseFolderButton.leadingAnchor, constant: -12),
             outputPathLabel.centerYAnchor.constraint(equalTo: chooseFolderButton.centerYAnchor),
             chooseFolderButton.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
-            chooseFolderButton.bottomAnchor.constraint(equalTo: controls.bottomAnchor, constant: -13),
+            chooseFolderButton.bottomAnchor.constraint(equalTo: controls.bottomAnchor, constant: -11),
             chooseFolderButton.topAnchor.constraint(greaterThanOrEqualTo: statusLabel.bottomAnchor, constant: 8)
         ])
     }
@@ -602,6 +777,27 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         UserDefaults.standard.set(value, forKey: borderPreferenceKey)
     }
 
+    @objc private func canvasChanged() {
+        let enabled = canvasToggle.state == .on
+        let value = (canvasSlider.doubleValue * 2).rounded() / 2
+        canvasSlider.doubleValue = value
+        canvasValue.stringValue = "\(value.formatted())%"
+        canvasSlider.isEnabled = enabled
+        canvasRatioButton.isEnabled = enabled
+        optimizeToggle.isHidden = !enabled
+        preview.canvasEnabled = enabled
+        preview.canvasPercent = value
+        let ratio = CanvasRatio(rawValue: canvasRatioButton.titleOfSelectedItem ?? "") ?? .square
+        preview.canvasRatio = ratio
+        UserDefaults.standard.set(enabled, forKey: canvasEnabledPreferenceKey)
+        UserDefaults.standard.set(value, forKey: canvasPreferenceKey)
+        UserDefaults.standard.set(ratio.rawValue, forKey: canvasRatioPreferenceKey)
+    }
+
+    @objc private func optimizeChanged() {
+        UserDefaults.standard.set(optimizeToggle.state == .on, forKey: optimizePreferenceKey)
+    }
+
     private func updateOutputPath() {
         outputPathLabel.stringValue = outputDirectory?.path ?? "导入照片后确定导出位置"
         outputPathLabel.toolTip = outputPathLabel.stringValue
@@ -647,15 +843,19 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             return
         }
         var reserved: Set<String> = []
+        let settings = FrameSettings(borderPercent: preview.borderPercent,
+            canvasEnabled: canvasToggle.state == .on, canvasPercent: canvasSlider.doubleValue,
+            canvasRatio: preview.canvasRatio,
+            optimizeForXiaohongshu: optimizeToggle.state == .on)
         let jobs = photos.map { source in
-            (source, uniqueDestination(in: folder, for: source, reserved: &reserved))
+            (source, uniqueDestination(in: folder, for: source, optimized: settings.optimized, reserved: &reserved))
         }
-        startExport(jobs)
+        startExport(jobs, settings: settings)
     }
 
-    private func uniqueDestination(in folder: URL, for source: URL, reserved: inout Set<String>) -> URL {
+    private func uniqueDestination(in folder: URL, for source: URL, optimized: Bool, reserved: inout Set<String>) -> URL {
         let name = source.deletingPathExtension().lastPathComponent + "_framed"
-        let ext = ExportFormat(source: source).fileExtension
+        let ext = optimized ? "jpg" : ExportFormat(source: source).fileExtension
         var result = folder.appendingPathComponent("\(name).\(ext)")
         var number = 2
         while reserved.contains(result.path) || FileManager.default.fileExists(atPath: result.path) {
@@ -666,8 +866,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         return result
     }
 
-    private func startExport(_ jobs: [(URL, URL)]) {
-        let percent = preview.borderPercent
+    private func startExport(_ jobs: [(URL, URL)], settings: FrameSettings) {
         isExporting = true
         exportButton.isEnabled = false
         statusLabel.stringValue = "正在导出 0/\(jobs.count)"
@@ -675,7 +874,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             var failures: [String] = []
             for (index, job) in jobs.enumerated() {
                 do {
-                    try FrameRenderer.render(source: job.0, destination: job.1, borderPercent: percent)
+                    try FrameRenderer.render(source: job.0, destination: job.1, settings: settings)
                 } catch {
                     failures.append(error.localizedDescription)
                 }
@@ -703,8 +902,12 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     }
 }
 
+#if !PHOTOFRAME_TESTS
 let application = NSApplication.shared
 private let controller = AppController()
 application.delegate = controller
 application.setActivationPolicy(.regular)
 application.run()
+#else
+try runRendererTests()
+#endif

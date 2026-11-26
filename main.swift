@@ -45,7 +45,8 @@ private enum FrameError: LocalizedError {
 }
 
 enum CanvasRatio: String, CaseIterable {
-    case square = "1:1", portraitFourFive = "4:5", portraitThreeFour = "3:4"
+    case square = "1:1", portraitThreeFour = "3:4", portraitThreeFive = "3:5"
+    case portraitFourFive = "4:5"
     case portraitTwoThree = "2:3", portraitNineSixteen = "9:16"
     case landscapeFiveFour = "5:4", landscapeFourThree = "4:3"
     case landscapeThreeTwo = "3:2", landscapeSixteenNine = "16:9"
@@ -54,8 +55,9 @@ enum CanvasRatio: String, CaseIterable {
     var components: (Int, Int)? {
         switch self {
         case .square: return (1, 1)
-        case .portraitFourFive: return (4, 5)
         case .portraitThreeFour: return (3, 4)
+        case .portraitThreeFive: return (3, 5)
+        case .portraitFourFive: return (4, 5)
         case .portraitTwoThree: return (2, 3)
         case .portraitNineSixteen: return (9, 16)
         case .landscapeFiveFour: return (5, 4)
@@ -74,7 +76,7 @@ struct FrameSettings {
     let canvasRatio: CanvasRatio
     let optimizeForXiaohongshu: Bool
 
-    var optimized: Bool { canvasEnabled && optimizeForXiaohongshu }
+    var optimized: Bool { optimizeForXiaohongshu }
 }
 
 struct FrameGeometry {
@@ -196,9 +198,29 @@ enum FrameRenderer {
     }
 }
 
+private final class DragOutlineView: NSView {
+    var isHighlighted = false {
+        didSet { needsDisplay = true }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard isHighlighted else { return }
+        NSColor(calibratedRed: 1, green: 0.57, blue: 0.02, alpha: 1).setStroke()
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 8, dy: 8), xRadius: 12, yRadius: 12)
+        path.lineWidth = 3
+        path.setLineDash([10, 7], count: 2, phase: 0)
+        path.stroke()
+    }
+}
+
 private final class DropView: NSView {
     var onDrop: (([URL]) -> Void)?
     private var dragIsInside = false
+    private var dropOutline: DragOutlineView?
+
+    override var acceptsFirstResponder: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -207,25 +229,43 @@ private final class DropView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
+    func installDropOutline() {
+        guard dropOutline == nil else { return }
+        let outline = DragOutlineView(frame: .zero)
+        outline.translatesAutoresizingMaskIntoConstraints = false
+        outline.isHighlighted = dragIsInside
+        addSubview(outline, positioned: .above, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            outline.leadingAnchor.constraint(equalTo: leadingAnchor),
+            outline.trailingAnchor.constraint(equalTo: trailingAnchor),
+            outline.topAnchor.constraint(equalTo: topAnchor),
+            outline.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        dropOutline = outline
+    }
+
+    private func setDragHighlight(_ highlighted: Bool) {
+        dragIsInside = highlighted
+        dropOutline?.isHighlighted = highlighted
+        needsDisplay = true
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) else {
             return []
         }
-        dragIsInside = true
-        needsDisplay = true
+        setDragHighlight(true)
         return .copy
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
-        dragIsInside = false
-        needsDisplay = true
+        setDragHighlight(false)
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { true }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        dragIsInside = false
-        needsDisplay = true
+        setDragHighlight(false)
         guard let urls = sender.draggingPasteboard.readObjects(
             forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]
         ) as? [URL], !urls.isEmpty else { return false }
@@ -233,27 +273,156 @@ private final class DropView: NSView {
         return true
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        if dragIsInside {
-            NSColor(calibratedRed: 0.79, green: 0.31, blue: 0.18, alpha: 1).setStroke()
-            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 7, dy: 7), xRadius: 7, yRadius: 7)
-            path.lineWidth = 3
-            path.setLineDash([10, 7], count: 2, phase: 0)
-            path.stroke()
+}
+
+private final class RoundToolbarButton: NSButton {
+    var onDoubleClick: (() -> Void)?
+    var circleColor = NSColor.white {
+        didSet { needsDisplay = true }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount >= 2, let onDoubleClick {
+            onDoubleClick()
+        } else {
+            super.mouseDown(with: event)
         }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let diameter = min(bounds.width, bounds.height)
+        let circle = NSRect(x: bounds.midX - diameter / 2, y: bounds.midY - diameter / 2,
+                            width: diameter, height: diameter)
+        (isHighlighted ? circleColor.withAlphaComponent(0.8) : circleColor).setFill()
+        NSBezierPath(ovalIn: circle).fill()
+        super.draw(dirtyRect)
+    }
+}
+
+private final class QuickHelpRegistration: NSObject {
+    weak var view: NSView?
+    let message: () -> String
+
+    init(view: NSView, message: @escaping () -> String) {
+        self.view = view
+        self.message = message
+    }
+}
+
+private final class QuickHelpController: NSObject {
+    private var pending: DispatchWorkItem?
+    private var helpWindow: NSPanel?
+    private weak var hoveredView: NSView?
+    private var registrations: [ObjectIdentifier: QuickHelpRegistration] = [:]
+
+    func add(to view: NSView, message: @escaping () -> String) {
+        view.toolTip = nil
+        let registration = QuickHelpRegistration(view: view, message: message)
+        if registrations.count > 256 {
+            registrations = registrations.filter { $0.value.view != nil }
+        }
+        registrations[ObjectIdentifier(view)] = registration
+        let area = NSTrackingArea(rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: ["quickHelp": registration])
+        view.addTrackingArea(area)
+    }
+
+    @objc func mouseEntered(with event: NSEvent) {
+        guard let registration = event.trackingArea?.userInfo?["quickHelp"] as? QuickHelpRegistration,
+              let view = registration.view else { return }
+        schedule(registration, for: view)
+    }
+
+    func handlePointer(_ event: NSEvent) {
+        guard event.type == .mouseMoved else { hide(); return }
+        guard let window = event.window, window.isKeyWindow,
+              let root = window.contentView else { hide(); return }
+        var view = root.hitTest(event.locationInWindow)
+        while let candidate = view {
+            if let registration = registrations[ObjectIdentifier(candidate)], registration.view === candidate {
+                if hoveredView !== candidate { schedule(registration, for: candidate) }
+                return
+            }
+            view = candidate.superview
+        }
+        hide()
+    }
+
+    private func schedule(_ registration: QuickHelpRegistration, for view: NSView) {
+        if hoveredView === view { return }
+        hide()
+        hoveredView = view
+        let work = DispatchWorkItem { [weak self, weak view] in
+            guard let self, let view, self.hoveredView === view, view.window?.isKeyWindow == true else { return }
+            self.show(registration.message(), beside: view)
+        }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    @objc func mouseExited(with event: NSEvent) {
+        guard let registration = event.trackingArea?.userInfo?["quickHelp"] as? QuickHelpRegistration,
+              hoveredView === registration.view else { return }
+        hide()
+    }
+
+    private func show(_ message: String, beside view: NSView) {
+        guard let window = view.window, let screen = window.screen else { return }
+        let label = NSTextField(labelWithString: message)
+        let font = NSFont.systemFont(ofSize: 12)
+        label.font = font
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let textWidth = ceil((message as NSString).size(withAttributes: attributes).width)
+        let width: CGFloat = min(380, max(190, textWidth + 40))
+        let textBounds = (message as NSString).boundingRect(
+            with: NSSize(width: width - 28, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes)
+        let height: CGFloat = max(40, ceil(textBounds.height) + 24)
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        content.layer?.cornerRadius = 12
+        label.frame = NSRect(x: 12, y: 12, width: width - 24, height: height - 24)
+        content.addSubview(label)
+        let anchor = window.convertToScreen(view.convert(view.bounds, to: nil))
+        let available = screen.visibleFrame
+        let x = min(max(anchor.midX - width / 2, available.minX + 8), available.maxX - width - 8)
+        let below = anchor.minY - height - 8
+        let y = below >= available.minY + 8 ? below : anchor.maxY + 8
+        let help = NSPanel(contentRect: NSRect(x: x, y: y, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        help.backgroundColor = .clear
+        help.isOpaque = false
+        help.hasShadow = true
+        help.level = .floating
+        help.ignoresMouseEvents = true
+        help.contentView = content
+        help.orderFront(nil)
+        helpWindow = help
+    }
+
+    private func hide() {
+        pending?.cancel()
+        pending = nil
+        hoveredView = nil
+        helpWindow?.orderOut(nil)
+        helpWindow = nil
     }
 }
 
 private final class PreviewView: NSView {
     var image: NSImage? { didSet { needsDisplay = true } }
+    var backgroundColor = NSColor(calibratedRed: 0.95, green: 0.956, blue: 0.97, alpha: 1) { didSet { needsDisplay = true } }
     var borderPercent = 8.0 { didSet { needsDisplay = true } }
-    var canvasEnabled = false { didSet { needsDisplay = true } }
+    var canvasEnabled = true { didSet { needsDisplay = true } }
     var canvasPercent = 10.0 { didSet { needsDisplay = true } }
     var canvasRatio = CanvasRatio.square { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor(calibratedRed: 0.89, green: 0.91, blue: 0.89, alpha: 1).setFill()
+        backgroundColor.setFill()
         bounds.fill()
         guard let image else {
             drawEmptyState()
@@ -310,6 +479,10 @@ private final class PreviewView: NSView {
     }
 }
 
+private final class FullscreenPreviewWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
 private extension NSShadow {
     func apply(_ configure: (NSShadow) -> Void) {
         configure(self)
@@ -318,6 +491,7 @@ private extension NSShadow {
 }
 
 final class ConfettiView: NSView {
+    static let burstDuration = 0.1
     private let emitter = CAEmitterLayer()
 
     override init(frame frameRect: NSRect) {
@@ -335,11 +509,12 @@ final class ConfettiView: NSView {
                                  .systemGreen, .systemTeal, .systemPink]
         emitter.emitterShape = .point
         emitter.emitterMode = .points
+        emitter.birthRate = 0
         emitter.emitterCells = colors.map { color in
             let cell = CAEmitterCell()
             cell.contents = tile
             cell.color = color.cgColor
-            cell.birthRate = 35
+            cell.birthRate = 88
             cell.lifetime = 3.2
             cell.lifetimeRange = 0.5
             cell.velocity = 650
@@ -367,11 +542,23 @@ final class ConfettiView: NSView {
         emitter.emitterSize = .zero
     }
 
-    func stop() { emitter.birthRate = 0 }
+    func burst() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        emitter.birthRate = 1
+        CATransaction.commit()
+    }
+
+    func stop() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        emitter.birthRate = 0
+        CATransaction.commit()
+    }
 }
 
-private final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
-    private let accent = NSColor(calibratedRed: 0.79, green: 0.31, blue: 0.18, alpha: 1)
+private final class AppController: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+    private let accent = NSColor(calibratedRed: 1, green: 0.57, blue: 0.02, alpha: 1)
     private let supportedExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "bmp", "gif"
     ]
@@ -380,26 +567,42 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     private var selectedURL: URL?
     private var outputDirectory: URL?
     private var isExporting = false
-    private let table = NSTableView()
+    private var fullscreenWindow: FullscreenPreviewWindow?
+    private var fullscreenImage: PreviewView?
+    private var fullscreenBackdrop: NSView?
+    private var previewKeyMonitor: Any?
+    private var quickHelpMonitor: Any?
+    private var previewSourceRect: NSRect = .zero
+    private var previewIsClosing = false
+    private let quickHelp = QuickHelpController()
     private let preview = PreviewView()
     private let selectedName = NSTextField(labelWithString: "预览")
     private let dimensions = NSTextField(labelWithString: "")
-    private let countLabel = NSTextField(labelWithString: "0")
+    private let thumbnailScroll = NSScrollView()
+    private let thumbnailStack = NSStackView()
+    private var previewAboveThumbnails: NSLayoutConstraint!
+    private var previewAboveControls: NSLayoutConstraint!
     private let borderInput = NSTextField(string: "8.0")
-    private let statusLabel = NSTextField(labelWithString: "每边宽度按照片短边计算")
+    private let statusLabel = NSTextField(labelWithString: "")
     private let outputPathLabel = NSTextField(labelWithString: "导入照片后确定导出位置")
     private let slider = NSSlider(value: 8, minValue: 0, maxValue: 30, target: nil, action: nil)
-    private let canvasToggle = NSButton(checkboxWithTitle: "纯白色画布", target: nil, action: nil)
-    private let canvasRatioButton = NSPopUpButton(frame: .zero, pullsDown: false)
+    private var optimizeToolbarButton: RoundToolbarButton?
+    private let ratioSegments = NSSegmentedControl(labels: ["1:1", "3:4", "3:5", "原图", "更多比例"], trackingMode: .selectOne, target: nil, action: nil)
     private let canvasSlider = NSSlider(value: 10, minValue: 0, maxValue: 50, target: nil, action: nil)
     private let canvasInput = NSTextField(string: "10")
     private var confettiView: ConfettiView?
-    private let optimizeToggle = NSButton(checkboxWithTitle: "小红书优化（最长边 ≤3500 像素，≤10 MB）", target: nil, action: nil)
+    private var optimizeForXiaohongshu = UserDefaults.standard.object(forKey: "optimizeForXiaohongshu") == nil
+        || UserDefaults.standard.bool(forKey: "optimizeForXiaohongshu") {
+        didSet {
+            UserDefaults.standard.set(optimizeForXiaohongshu, forKey: optimizePreferenceKey)
+            UserDefaults.standard.synchronize()
+            updateOptimizeToolbar()
+        }
+    }
     private let exportButton = NSButton(title: "导出照片", target: nil, action: nil)
     private let chooseFolderButton = NSButton(title: "选择文件夹", target: nil, action: nil)
     private let borderPreferenceKey = "borderPercent"
     private let canvasPreferenceKey = "canvasPercent"
-    private let canvasEnabledPreferenceKey = "canvasEnabled"
     private let canvasRatioPreferenceKey = "canvasRatio"
     private let optimizePreferenceKey = "optimizeForXiaohongshu"
 
@@ -413,199 +616,201 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             slider.doubleValue = min(max(saved.doubleValue, 0), 30)
             borderChanged()
         }
-        canvasToggle.state = UserDefaults.standard.bool(forKey: canvasEnabledPreferenceKey) ? .on : .off
-        canvasRatioButton.selectItem(withTitle: UserDefaults.standard.string(forKey: canvasRatioPreferenceKey) ?? CanvasRatio.square.rawValue)
+        let savedRatio = CanvasRatio(rawValue: UserDefaults.standard.string(forKey: canvasRatioPreferenceKey) ?? "") ?? .square
+        applyCanvasRatio(savedRatio)
         if let saved = UserDefaults.standard.object(forKey: canvasPreferenceKey) as? NSNumber {
             canvasSlider.doubleValue = min(max(saved.doubleValue, 0), 50)
         }
-        optimizeToggle.state = UserDefaults.standard.object(forKey: optimizePreferenceKey) == nil
-            || UserDefaults.standard.bool(forKey: optimizePreferenceKey) ? .on : .off
+        updateOptimizeToolbar()
         canvasChanged(nil)
         installMenu()
         window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(window.contentView)
+        previewKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self else { return event }
+            return self.handlePreviewKey(event)
+        }
+        quickHelpMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .scrollWheel]) { [weak self] event in
+            self?.quickHelp.handlePointer(event)
+            return event
+        }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let previewKeyMonitor { NSEvent.removeMonitor(previewKeyMonitor) }
+        if let quickHelpMonitor { NSEvent.removeMonitor(quickHelpMonitor) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 980, height: 650),
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 900),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false
         )
         window.title = "Photoframe · 黑边相框"
+        window.acceptsMouseMovedEvents = true
         window.center()
-        window.minSize = NSSize(width: 780, height: 620)
+        window.contentAspectRatio = NSSize(width: 1, height: 1)
+        window.minSize = NSSize(width: 720, height: 720)
 
         let root = DropView(frame: .zero)
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedRed: 0.95, green: 0.96, blue: 0.95, alpha: 1).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedRed: 0.95, green: 0.956, blue: 0.97, alpha: 1).cgColor
         root.onDrop = { [weak self] urls in self?.importURLs(urls) }
         window.contentView = root
+        window.initialFirstResponder = root
 
         let header = NSView()
-        header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor.white.cgColor
-        let sidebar = NSView()
-        sidebar.wantsLayer = true
-        sidebar.layer?.backgroundColor = NSColor(calibratedWhite: 0.985, alpha: 1).cgColor
-        let main = NSView()
         let controls = NSView()
         controls.wantsLayer = true
-        controls.layer?.backgroundColor = NSColor.white.cgColor
-        for view in [header, sidebar, main, controls, preview] { view.translatesAutoresizingMaskIntoConstraints = false }
+        controls.layer?.backgroundColor = NSColor(calibratedRed: 0.91, green: 0.916, blue: 0.93, alpha: 1).cgColor
+        controls.layer?.cornerRadius = 26
+        thumbnailScroll.drawsBackground = false
+        thumbnailScroll.hasVerticalScroller = false
+        thumbnailScroll.hasHorizontalScroller = true
+        thumbnailScroll.autohidesScrollers = true
+        thumbnailScroll.borderType = .noBorder
+        thumbnailStack.orientation = .horizontal
+        thumbnailStack.alignment = .centerY
+        thumbnailStack.spacing = 12
+        for view in [header, controls, preview, thumbnailScroll] { view.translatesAutoresizingMaskIntoConstraints = false }
         root.addSubview(header)
-        root.addSubview(sidebar)
-        root.addSubview(main)
-        main.addSubview(preview)
-        main.addSubview(controls)
+        root.addSubview(preview)
+        root.addSubview(thumbnailScroll)
+        root.addSubview(controls)
+        thumbnailScroll.documentView = thumbnailStack
 
+        previewAboveThumbnails = preview.bottomAnchor.constraint(equalTo: thumbnailScroll.topAnchor)
+        previewAboveControls = preview.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -12)
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: root.topAnchor),
-            header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 62),
-            sidebar.topAnchor.constraint(equalTo: header.bottomAnchor),
-            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 238),
-            main.topAnchor.constraint(equalTo: header.bottomAnchor),
-            main.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            main.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            main.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            preview.leadingAnchor.constraint(equalTo: main.leadingAnchor),
-            preview.trailingAnchor.constraint(equalTo: main.trailingAnchor),
-            preview.topAnchor.constraint(equalTo: main.topAnchor, constant: 48),
-            preview.bottomAnchor.constraint(equalTo: controls.topAnchor),
-            controls.leadingAnchor.constraint(equalTo: main.leadingAnchor),
-            controls.trailingAnchor.constraint(equalTo: main.trailingAnchor),
-            controls.bottomAnchor.constraint(equalTo: main.bottomAnchor),
-            controls.heightAnchor.constraint(equalToConstant: 244)
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            header.heightAnchor.constraint(equalToConstant: 76),
+            preview.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            preview.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            preview.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 2),
+            previewAboveControls,
+            thumbnailScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            thumbnailScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
+            thumbnailScroll.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -3),
+            thumbnailScroll.heightAnchor.constraint(equalToConstant: 70),
+            controls.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            controls.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            controls.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            controls.heightAnchor.constraint(equalToConstant: 264)
         ])
 
         buildHeader(header)
-        buildSidebar(sidebar)
-        buildMain(main, controls)
+        buildMain(controls)
+        root.installDropOutline()
     }
 
     private func buildHeader(_ header: NSView) {
-        let icon = NSImageView(image: NSImage(systemSymbolName: "square.on.square", accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = accent
-        let title = label("Photoframe", size: 17, weight: .semibold)
-        let subtitle = label("黑边相框", size: 12, color: .secondaryLabelColor)
-        let importButton = NSButton(title: "导入照片", target: self, action: #selector(openPhotos))
-        importButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
-        importButton.imagePosition = .imageLeading
-        importButton.bezelStyle = .rounded
+        let importButton = toolbarButton(symbol: "plus", label: "添加照片", filled: true)
+        importButton.target = self
+        importButton.action = #selector(openPhotos)
+        importButton.toolTip = "导入照片或文件夹"
+        let clearButton = toolbarButton(symbol: "trash", label: "删除当前照片；双击清空所有照片")
+        clearButton.target = self
+        clearButton.action = #selector(deleteSelectedPhoto)
+        clearButton.onDoubleClick = { [weak self] in self?.clearPhotos() }
+        clearButton.toolTip = "单击删除当前照片，双击清空所有照片"
+        let optimizeButton = toolbarButton(symbol: "wand.and.stars", label: "关闭小红书优化")
+        optimizeButton.target = self
+        optimizeButton.action = #selector(toggleOptimizeFromToolbar)
+        optimizeToolbarButton = optimizeButton
+        let menuButton = toolbarButton(symbol: "line.3.horizontal", label: "更多操作")
+        menuButton.target = self
+        menuButton.action = #selector(showActionMenu(_:))
+        menuButton.toolTip = "更多操作：导入照片、清空照片或选择导出文件夹"
+        quickHelp.add(to: importButton) { "导入照片或文件夹" }
+        quickHelp.add(to: clearButton) { "单击删除当前照片，双击清空所有照片" }
+        quickHelp.add(to: optimizeButton) { [weak self] in
+            self?.optimizeForXiaohongshu == true
+                ? "小红书优化已开启：导出 JPEG，最长边不超过 3500 像素，文件不超过 10 MB。点击关闭"
+                : "小红书优化已关闭。点击开启 JPEG 压缩与尺寸限制"
+        }
+        quickHelp.add(to: menuButton) { "更多操作：导入照片、清空照片或选择导出文件夹" }
+        selectedName.font = .systemFont(ofSize: 14, weight: .semibold)
+        selectedName.alignment = .center
+        dimensions.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        dimensions.textColor = .secondaryLabelColor
+        dimensions.alignment = .center
         exportButton.target = self
         exportButton.action = #selector(exportPhotos)
-        exportButton.image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: nil)
-        exportButton.imagePosition = .imageLeading
-        exportButton.bezelStyle = .rounded
-        exportButton.isEnabled = false
-        for view in [icon, title, subtitle, importButton, exportButton] {
+        for view in [importButton, clearButton, selectedName, dimensions, optimizeButton, menuButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview(view)
         }
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 22),
-            icon.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 22), icon.heightAnchor.constraint(equalToConstant: 22),
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-            title.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            subtitle.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 12),
-            subtitle.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            exportButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -22),
-            exportButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            importButton.trailingAnchor.constraint(equalTo: exportButton.leadingAnchor, constant: -10),
-            importButton.centerYAnchor.constraint(equalTo: header.centerYAnchor)
+            importButton.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            importButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            importButton.widthAnchor.constraint(equalToConstant: 52),
+            importButton.heightAnchor.constraint(equalTo: importButton.widthAnchor),
+            clearButton.leadingAnchor.constraint(equalTo: importButton.trailingAnchor, constant: 14),
+            clearButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            clearButton.widthAnchor.constraint(equalToConstant: 48),
+            clearButton.heightAnchor.constraint(equalTo: clearButton.widthAnchor),
+            selectedName.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+            selectedName.centerYAnchor.constraint(equalTo: header.centerYAnchor, constant: -7),
+            selectedName.leadingAnchor.constraint(greaterThanOrEqualTo: clearButton.trailingAnchor, constant: 24),
+            selectedName.trailingAnchor.constraint(lessThanOrEqualTo: optimizeButton.leadingAnchor, constant: -24),
+            dimensions.centerXAnchor.constraint(equalTo: selectedName.centerXAnchor),
+            dimensions.topAnchor.constraint(equalTo: selectedName.bottomAnchor, constant: 2),
+            optimizeButton.trailingAnchor.constraint(equalTo: menuButton.leadingAnchor, constant: -12),
+            optimizeButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            optimizeButton.widthAnchor.constraint(equalToConstant: 48),
+            optimizeButton.heightAnchor.constraint(equalTo: optimizeButton.widthAnchor),
+            menuButton.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            menuButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            menuButton.widthAnchor.constraint(equalToConstant: 48),
+            menuButton.heightAnchor.constraint(equalTo: menuButton.widthAnchor)
         ])
     }
 
-    private func buildSidebar(_ sidebar: NSView) {
-        let heading = label("照片", size: 12, weight: .semibold, color: .secondaryLabelColor)
-        countLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        countLabel.textColor = .secondaryLabelColor
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        table.headerView = nil
-        table.rowHeight = 43
-        table.intercellSpacing = NSSize(width: 0, height: 2)
-        table.selectionHighlightStyle = .regular
-        table.dataSource = self
-        table.delegate = self
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("photo"))
-        column.resizingMask = .autoresizingMask
-        table.addTableColumn(column)
-        scroll.documentView = table
-        let clearButton = NSButton(title: "清空列表", target: self, action: #selector(clearPhotos))
-        clearButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
-        clearButton.imagePosition = .imageLeading
-        clearButton.bezelStyle = .roundRect
-        for view in [heading, countLabel, scroll, clearButton] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            sidebar.addSubview(view)
-        }
-        NSLayoutConstraint.activate([
-            heading.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 18),
-            heading.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 17),
-            countLabel.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -18),
-            countLabel.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            scroll.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 47),
-            scroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
-            scroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
-            scroll.bottomAnchor.constraint(equalTo: clearButton.topAnchor, constant: -10),
-            clearButton.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
-            clearButton.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -14)
-        ])
+    private func toolbarButton(symbol: String, label accessibilityLabel: String, filled: Bool = false) -> RoundToolbarButton {
+        let button = RoundToolbarButton(title: "", target: nil, action: nil)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: accessibilityLabel)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 18, weight: .medium))
+        button.image = image
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.isBordered = false
+        button.wantsLayer = true
+        button.circleColor = filled ? accent : .white
+        button.contentTintColor = filled ? .white : NSColor(calibratedRed: 0.31, green: 0.34, blue: 0.39, alpha: 1)
+        button.setAccessibilityLabel(accessibilityLabel)
+        return button
     }
 
-    private func buildMain(_ main: NSView, _ controls: NSView) {
-        selectedName.font = .systemFont(ofSize: 13, weight: .semibold)
-        selectedName.lineBreakMode = .byTruncatingMiddle
-        dimensions.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        dimensions.textColor = .secondaryLabelColor
-        let heading = label("黑边大小", size: 13, weight: .medium)
-        let zero = label("0", size: 11, color: .secondaryLabelColor)
-        let max = label("30%", size: 11, color: .secondaryLabelColor)
-        borderInput.font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
+    private func buildMain(_ controls: NSView) {
+        let ratioHeading = label("画布比例", size: 12, weight: .semibold, color: .secondaryLabelColor)
+        let panel = NSView()
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = NSColor(calibratedRed: 0.84, green: 0.85, blue: 0.87, alpha: 1).cgColor
+        panel.layer?.cornerRadius = 22
+        let borderHeading = label("黑边", size: 13, weight: .medium)
+        let canvasHeading = label("留白", size: 13, weight: .medium)
+        borderHeading.toolTip = "黑边宽度：按原照片短边的百分比计算"
+        canvasHeading.toolTip = "白色画布留白：按原照片短边的百分比计算"
+        let borderZero = label("0", size: 11, color: .secondaryLabelColor)
+        let borderMax = label("30", size: 11, color: .secondaryLabelColor)
+        let canvasZero = label("0", size: 11, color: .secondaryLabelColor)
+        let canvasMax = label("50", size: 11, color: .secondaryLabelColor)
+        let borderUnit = label("%", size: 12, weight: .medium, color: accent)
+        let canvasUnit = label("%", size: 12, weight: .medium, color: accent)
+        borderInput.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
         borderInput.textColor = accent
         borderInput.alignment = .right
         borderInput.delegate = self
         borderInput.target = self
         borderInput.action = #selector(borderInputCommitted)
         borderInput.setAccessibilityLabel("黑边大小，百分比")
-        let percentUnit = label("%", size: 13, weight: .medium, color: accent)
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        outputPathLabel.font = .systemFont(ofSize: 11)
-        outputPathLabel.textColor = .secondaryLabelColor
-        outputPathLabel.lineBreakMode = .byTruncatingMiddle
-        outputPathLabel.toolTip = outputPathLabel.stringValue
-        let outputHeading = label("导出到", size: 12, weight: .medium)
-        chooseFolderButton.target = self
-        chooseFolderButton.action = #selector(chooseOutputFolder)
-        chooseFolderButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
-        chooseFolderButton.imagePosition = .imageLeading
-        chooseFolderButton.bezelStyle = .roundRect
-        chooseFolderButton.isEnabled = false
-        slider.target = self
-        slider.action = #selector(borderChanged)
-        slider.isContinuous = true
-        canvasToggle.target = self
-        canvasToggle.action = #selector(canvasChanged(_:))
-        canvasToggle.font = .systemFont(ofSize: 12, weight: .medium)
-        canvasRatioButton.addItems(withTitles: CanvasRatio.allCases.map(\.rawValue))
-        canvasRatioButton.target = self
-        canvasRatioButton.action = #selector(canvasChanged(_:))
-        canvasRatioButton.setAccessibilityLabel("白色画布比例")
-        let ratioHeading = label("比例", size: 12, color: .secondaryLabelColor)
-        canvasSlider.target = self
-        canvasSlider.action = #selector(canvasChanged(_:))
-        canvasSlider.isContinuous = true
-        canvasSlider.setAccessibilityLabel("白色画布留白，按照片短边百分比")
+        borderInput.toolTip = "输入黑边宽度百分比（0–30）"
         canvasInput.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
         canvasInput.textColor = accent
         canvasInput.alignment = .right
@@ -613,74 +818,127 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         canvasInput.target = self
         canvasInput.action = #selector(canvasInputCommitted)
         canvasInput.setAccessibilityLabel("画布留白，按照片短边百分比")
-        let canvasUnit = label("%", size: 13, weight: .medium, color: accent)
-        optimizeToggle.target = self
-        optimizeToggle.action = #selector(optimizeChanged)
-        optimizeToggle.font = .systemFont(ofSize: 11)
-        let canvasHeading = label("画布留白", size: 12, weight: .medium)
-        for view in [selectedName, dimensions] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            main.addSubview(view)
+        canvasInput.toolTip = "输入白色画布留白百分比（0–50）"
+        slider.target = self
+        slider.action = #selector(borderChanged)
+        slider.isContinuous = true
+        slider.trackFillColor = accent
+        slider.toolTip = "调整黑边宽度（按照片短边的 0–30% 计算）"
+        canvasSlider.target = self
+        canvasSlider.action = #selector(canvasChanged(_:))
+        canvasSlider.isContinuous = true
+        canvasSlider.trackFillColor = accent
+        canvasSlider.setAccessibilityLabel("白色画布留白，按照片短边百分比")
+        canvasSlider.toolTip = "调整照片与白色画布边缘的最小距离（0–50%）"
+        ratioSegments.target = self
+        ratioSegments.action = #selector(canvasRatioPresetChanged(_:))
+        ratioSegments.segmentStyle = .rounded
+        ratioSegments.selectedSegment = 0
+        ratioSegments.selectedSegmentBezelColor = accent
+        ratioSegments.setAccessibilityLabel("画布比例快捷选项")
+        ratioSegments.setWidth(112, forSegment: 4)
+        quickHelp.add(to: ratioSegments) { [weak self] in
+            "设置白色画布比例（当前 \(self?.preview.canvasRatio.rawValue ?? "1:1")）；点击“更多比例”查看其他画幅"
         }
-        for view in [heading, borderInput, percentUnit, zero, slider, max, canvasToggle,
-                     ratioHeading, canvasRatioButton,
-                     canvasHeading, canvasSlider, canvasInput, canvasUnit, optimizeToggle, statusLabel,
-                     outputHeading, outputPathLabel, chooseFolderButton] {
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        outputPathLabel.font = .systemFont(ofSize: 11)
+        outputPathLabel.textColor = .secondaryLabelColor
+        outputPathLabel.lineBreakMode = .byTruncatingMiddle
+        outputPathLabel.toolTip = outputPathLabel.stringValue
+        chooseFolderButton.title = ""
+        chooseFolderButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "选择导出文件夹")
+        chooseFolderButton.bezelStyle = .rounded
+        chooseFolderButton.target = self
+        chooseFolderButton.action = #selector(chooseOutputFolder)
+        chooseFolderButton.toolTip = "选择导出文件夹；不选择时使用来源文件夹同级的默认文件夹"
+        chooseFolderButton.isEnabled = false
+        exportButton.bezelStyle = .rounded
+        exportButton.isBordered = false
+        exportButton.wantsLayer = true
+        exportButton.layer?.backgroundColor = NSColor(calibratedRed: 1, green: 0.59, blue: 0.02, alpha: 1).cgColor
+        exportButton.layer?.cornerRadius = 25
+        exportButton.contentTintColor = .white
+        exportButton.font = .systemFont(ofSize: 15, weight: .semibold)
+        exportButton.title = "导出"
+        exportButton.toolTip = "将所有导入的照片导出到所选文件夹"
+        exportButton.isEnabled = false
+        quickHelp.add(to: slider) { "调整黑边宽度（按照片短边的 0–30% 计算）" }
+        quickHelp.add(to: borderInput) { "输入黑边宽度百分比（0–30）" }
+        quickHelp.add(to: canvasSlider) { "调整照片与白色画布边缘的最小距离（0–50%）" }
+        quickHelp.add(to: canvasInput) { "输入白色画布留白百分比（0–50）" }
+        quickHelp.add(to: chooseFolderButton) { "选择导出文件夹；不选择时使用来源文件夹同级的默认文件夹" }
+        quickHelp.add(to: exportButton) { "将所有导入的照片导出到所选文件夹" }
+
+        let allControls: [NSView] = [ratioHeading, ratioSegments,
+            panel, borderHeading, canvasHeading, borderZero, borderMax, canvasZero, canvasMax, borderUnit, canvasUnit,
+            slider, borderInput, canvasSlider, canvasInput, statusLabel,
+            chooseFolderButton, outputPathLabel, exportButton]
+        for view in allControls {
             view.translatesAutoresizingMaskIntoConstraints = false
             controls.addSubview(view)
         }
+        for view in [borderHeading, borderZero, slider, borderMax, borderInput, borderUnit,
+                     canvasHeading, canvasZero, canvasSlider, canvasMax, canvasInput, canvasUnit] {
+            panel.addSubview(view)
+        }
         NSLayoutConstraint.activate([
-            selectedName.leadingAnchor.constraint(equalTo: main.leadingAnchor, constant: 24),
-            selectedName.centerYAnchor.constraint(equalTo: main.topAnchor, constant: 24),
-            selectedName.trailingAnchor.constraint(lessThanOrEqualTo: dimensions.leadingAnchor, constant: -12),
-            dimensions.trailingAnchor.constraint(equalTo: main.trailingAnchor, constant: -24),
-            dimensions.centerYAnchor.constraint(equalTo: selectedName.centerYAnchor),
-            heading.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 26),
-            heading.topAnchor.constraint(equalTo: controls.topAnchor, constant: 13),
-            percentUnit.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -26),
-            percentUnit.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            borderInput.trailingAnchor.constraint(equalTo: percentUnit.leadingAnchor, constant: -5),
-            borderInput.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            borderInput.widthAnchor.constraint(equalToConstant: 58),
-            zero.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
-            zero.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
-            slider.leadingAnchor.constraint(equalTo: zero.trailingAnchor, constant: 12),
-            slider.trailingAnchor.constraint(equalTo: max.leadingAnchor, constant: -12),
-            slider.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 9),
-            max.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
-            max.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
-            canvasToggle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
-            canvasToggle.topAnchor.constraint(equalTo: slider.bottomAnchor, constant: 9),
-            ratioHeading.trailingAnchor.constraint(equalTo: canvasRatioButton.leadingAnchor, constant: -8),
-            ratioHeading.centerYAnchor.constraint(equalTo: canvasRatioButton.centerYAnchor),
-            canvasRatioButton.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
-            canvasRatioButton.centerYAnchor.constraint(equalTo: canvasToggle.centerYAnchor),
-            canvasRatioButton.widthAnchor.constraint(equalToConstant: 118),
-            canvasToggle.trailingAnchor.constraint(lessThanOrEqualTo: ratioHeading.leadingAnchor, constant: -8),
-            canvasHeading.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            ratioHeading.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 28),
+            ratioHeading.centerYAnchor.constraint(equalTo: ratioSegments.centerYAnchor),
+            ratioSegments.leadingAnchor.constraint(equalTo: ratioHeading.trailingAnchor, constant: 18),
+            ratioSegments.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -24),
+            ratioSegments.topAnchor.constraint(equalTo: controls.topAnchor, constant: 10),
+            ratioSegments.heightAnchor.constraint(equalToConstant: 40),
+            panel.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 24),
+            panel.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -24),
+            panel.topAnchor.constraint(equalTo: ratioSegments.bottomAnchor, constant: 10),
+            panel.heightAnchor.constraint(equalToConstant: 108),
+            borderHeading.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 22),
+            borderHeading.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            borderZero.leadingAnchor.constraint(equalTo: borderHeading.trailingAnchor, constant: 18),
+            borderZero.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            slider.leadingAnchor.constraint(equalTo: borderZero.trailingAnchor, constant: 18),
+            slider.trailingAnchor.constraint(equalTo: borderMax.leadingAnchor, constant: -18),
+            slider.centerYAnchor.constraint(equalTo: panel.centerYAnchor, constant: -24),
+            borderMax.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            borderInput.leadingAnchor.constraint(equalTo: borderMax.trailingAnchor, constant: 18),
+            borderInput.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            borderInput.widthAnchor.constraint(equalToConstant: 56),
+            borderUnit.leadingAnchor.constraint(equalTo: borderInput.trailingAnchor, constant: 3),
+            borderUnit.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -18),
+            borderUnit.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            canvasHeading.leadingAnchor.constraint(equalTo: borderHeading.leadingAnchor),
             canvasHeading.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
-            canvasSlider.leadingAnchor.constraint(equalTo: canvasHeading.trailingAnchor, constant: 16),
-            canvasSlider.trailingAnchor.constraint(equalTo: canvasInput.leadingAnchor, constant: -12),
-            canvasSlider.topAnchor.constraint(equalTo: canvasToggle.bottomAnchor, constant: 9),
-            canvasInput.trailingAnchor.constraint(equalTo: canvasUnit.leadingAnchor, constant: -5),
-            canvasInput.widthAnchor.constraint(equalToConstant: 58),
+            canvasZero.leadingAnchor.constraint(equalTo: borderZero.leadingAnchor),
+            canvasZero.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
+            canvasSlider.leadingAnchor.constraint(equalTo: slider.leadingAnchor),
+            canvasSlider.trailingAnchor.constraint(equalTo: slider.trailingAnchor),
+            canvasSlider.centerYAnchor.constraint(equalTo: panel.centerYAnchor, constant: 24),
+            canvasMax.leadingAnchor.constraint(equalTo: borderMax.leadingAnchor),
+            canvasMax.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
+            canvasInput.leadingAnchor.constraint(equalTo: borderInput.leadingAnchor),
             canvasInput.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
-            canvasUnit.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
+            canvasInput.widthAnchor.constraint(equalTo: borderInput.widthAnchor),
+            canvasUnit.leadingAnchor.constraint(equalTo: canvasInput.trailingAnchor, constant: 3),
+            canvasUnit.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -18),
             canvasUnit.centerYAnchor.constraint(equalTo: canvasSlider.centerYAnchor),
-            optimizeToggle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
-            optimizeToggle.topAnchor.constraint(equalTo: canvasSlider.bottomAnchor, constant: 9),
-            statusLabel.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: controls.trailingAnchor, constant: -26),
-            statusLabel.topAnchor.constraint(equalTo: optimizeToggle.bottomAnchor, constant: 8),
-            outputHeading.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
-            outputHeading.centerYAnchor.constraint(equalTo: chooseFolderButton.centerYAnchor),
-            outputPathLabel.leadingAnchor.constraint(equalTo: outputHeading.trailingAnchor, constant: 10),
-            outputPathLabel.trailingAnchor.constraint(equalTo: chooseFolderButton.leadingAnchor, constant: -12),
+            statusLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 22),
+            statusLabel.topAnchor.constraint(equalTo: panel.bottomAnchor, constant: 12),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: exportButton.leadingAnchor, constant: -12),
+            chooseFolderButton.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 28),
+            chooseFolderButton.bottomAnchor.constraint(equalTo: controls.bottomAnchor, constant: -12),
+            chooseFolderButton.widthAnchor.constraint(equalToConstant: 42),
+            chooseFolderButton.heightAnchor.constraint(equalToConstant: 42),
+            outputPathLabel.leadingAnchor.constraint(equalTo: chooseFolderButton.trailingAnchor, constant: 8),
             outputPathLabel.centerYAnchor.constraint(equalTo: chooseFolderButton.centerYAnchor),
-            chooseFolderButton.trailingAnchor.constraint(equalTo: percentUnit.trailingAnchor),
-            chooseFolderButton.bottomAnchor.constraint(equalTo: controls.bottomAnchor, constant: -11),
-            chooseFolderButton.topAnchor.constraint(greaterThanOrEqualTo: statusLabel.bottomAnchor, constant: 8)
+            outputPathLabel.trailingAnchor.constraint(lessThanOrEqualTo: exportButton.leadingAnchor, constant: -16),
+            exportButton.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -28),
+            exportButton.centerYAnchor.constraint(equalTo: chooseFolderButton.centerYAnchor),
+            exportButton.widthAnchor.constraint(equalToConstant: 150),
+            exportButton.heightAnchor.constraint(equalToConstant: 48),
+            statusLabel.bottomAnchor.constraint(lessThanOrEqualTo: chooseFolderButton.topAnchor, constant: -8)
         ])
+        refreshThumbnails()
     }
 
     private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
@@ -708,38 +966,147 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         NSApp.mainMenu = menu
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { photos.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let url = photos[row]
-        let cell = NSTableCellView()
-        let name = label(url.deletingPathExtension().lastPathComponent, size: 12)
-        name.lineBreakMode = .byTruncatingMiddle
-        let ext = label(url.pathExtension.uppercased(), size: 10, color: .secondaryLabelColor)
-        let icon = NSImageView(image: NSImage(systemSymbolName: "photo", accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = accent
-        for view in [name, ext, icon] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            cell.addSubview(view)
+    private func refreshThumbnails() {
+        let hasPhotos = !photos.isEmpty
+        previewAboveControls.isActive = !hasPhotos
+        previewAboveThumbnails.isActive = hasPhotos
+        thumbnailScroll.isHidden = !hasPhotos
+        for view in thumbnailStack.arrangedSubviews {
+            thumbnailStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
         }
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 9),
-            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 20), icon.heightAnchor.constraint(equalToConstant: 20),
-            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9),
-            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
-            name.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
-            ext.leadingAnchor.constraint(equalTo: name.leadingAnchor),
-            ext.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 1)
-        ])
-        return cell
+        for (index, url) in photos.enumerated() {
+            let button = NSButton(title: "", target: self, action: #selector(thumbnailSelected(_:)))
+            button.tag = index
+            button.isBordered = false
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyUpOrDown
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 9
+            button.layer?.masksToBounds = true
+            button.layer?.backgroundColor = NSColor.white.cgColor
+            button.setAccessibilityLabel(url.lastPathComponent)
+            quickHelp.add(to: button) {
+                "\(url.lastPathComponent)：按住空格全屏预览图片，左/右方向键切换上一张/下一张"
+            }
+            button.widthAnchor.constraint(equalToConstant: 82).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 64).isActive = true
+            if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 160
+               ] as CFDictionary) {
+                button.image = NSImage(cgImage: thumbnail, size: NSSize(width: 78, height: 58))
+            } else {
+                button.image = NSImage(systemSymbolName: "photo", accessibilityDescription: nil)
+            }
+            thumbnailStack.addArrangedSubview(button)
+            updateThumbnailAppearance(button, selected: url == selectedURL)
+        }
+        thumbnailScroll.layoutSubtreeIfNeeded()
+        let viewportWidth = thumbnailScroll.contentView.bounds.width
+        let thumbnailWidth: CGFloat = 82
+        let spacing: CGFloat = 12
+        let stripWidth = CGFloat(photos.count) * (thumbnailWidth + spacing) - spacing
+        let padding = stripWidth > viewportWidth ? max(8, (viewportWidth - thumbnailWidth) / 2) : 8
+        thumbnailStack.edgeInsets = NSEdgeInsets(top: 0, left: padding, bottom: 0, right: padding)
+        let contentWidth = max(viewportWidth, stripWidth + 2 * padding)
+        thumbnailStack.setFrameSize(NSSize(width: contentWidth, height: 72))
+        thumbnailStack.frame = NSRect(x: 0, y: 0, width: contentWidth, height: 72)
+        thumbnailScroll.documentView = thumbnailStack
+        exportButton.title = photos.isEmpty ? "导出" : "导出 · \(photos.count)"
+        exportButton.isEnabled = !photos.isEmpty && !isExporting
+        chooseFolderButton.isEnabled = !photos.isEmpty
+        if let selectedURL, let selectedIndex = photos.firstIndex(of: selectedURL) {
+            centerThumbnail(at: selectedIndex)
+        }
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        let row = table.selectedRow
-        guard photos.indices.contains(row) else { return }
-        select(photos[row])
+    private func updateThumbnailAppearance(_ button: NSButton, selected: Bool) {
+        button.layer?.borderWidth = selected ? 2.5 : 1
+        button.layer?.borderColor = (selected ? NSColor(calibratedRed: 1, green: 0.57, blue: 0.02, alpha: 1) : NSColor.white).cgColor
     }
+
+    @objc private func thumbnailSelected(_ sender: NSButton) {
+        guard photos.indices.contains(sender.tag) else { return }
+        select(photos[sender.tag])
+    }
+
+    private func centerThumbnail(at index: Int) {
+        guard thumbnailStack.arrangedSubviews.indices.contains(index) else { return }
+        thumbnailStack.layoutSubtreeIfNeeded()
+        let button = thumbnailStack.arrangedSubviews[index]
+        let clipView = thumbnailScroll.contentView
+        let centerX = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: thumbnailStack).x
+        let furthestX = max(0, thumbnailStack.bounds.width - clipView.bounds.width)
+        let targetX = min(max(0, centerX - clipView.bounds.width / 2), furthestX)
+        clipView.scroll(to: NSPoint(x: targetX, y: clipView.bounds.origin.y))
+        thumbnailScroll.reflectScrolledClipView(clipView)
+    }
+
+    @objc private func canvasRatioPresetChanged(_ sender: NSSegmentedControl) {
+        let ratios: [CanvasRatio] = [.square, .portraitThreeFour, .portraitThreeFive, .original]
+        if sender.selectedSegment == ratios.count {
+            let menu = NSMenu(title: "更多画布比例")
+            for ratio in CanvasRatio.allCases where !ratios.contains(ratio) {
+                let item = menu.addItem(withTitle: ratio.rawValue,
+                    action: #selector(additionalCanvasRatioSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = ratio.rawValue
+                item.state = preview.canvasRatio == ratio ? .on : .off
+            }
+            menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX - 112, y: sender.bounds.minY), in: sender)
+            applyCanvasRatio(preview.canvasRatio)
+            return
+        }
+        guard ratios.indices.contains(sender.selectedSegment) else { return }
+        applyCanvasRatio(ratios[sender.selectedSegment])
+    }
+
+    @objc private func additionalCanvasRatioSelected(_ sender: NSMenuItem) {
+        guard let ratio = CanvasRatio(rawValue: sender.representedObject as? String ?? ""),
+              ![CanvasRatio.square, .portraitThreeFour, .portraitThreeFive, .original].contains(ratio) else { return }
+        applyCanvasRatio(ratio)
+    }
+
+    private func applyCanvasRatio(_ ratio: CanvasRatio) {
+        preview.canvasRatio = ratio
+        fullscreenImage?.canvasRatio = ratio
+        let quickRatios: [CanvasRatio] = [.square, .portraitThreeFour, .portraitThreeFive, .original]
+        if let index = quickRatios.firstIndex(of: ratio) {
+            ratioSegments.selectedSegment = index
+        } else {
+            ratioSegments.selectedSegment = 4
+        }
+        UserDefaults.standard.set(ratio.rawValue, forKey: canvasRatioPreferenceKey)
+    }
+
+    @objc private func toggleOptimizeFromToolbar() {
+        optimizeForXiaohongshu.toggle()
+    }
+
+    private func updateOptimizeToolbar() {
+        let enabled = optimizeForXiaohongshu
+        optimizeToolbarButton?.circleColor = enabled ? accent : .white
+        optimizeToolbarButton?.contentTintColor = enabled ? .white
+            : NSColor(calibratedRed: 0.31, green: 0.34, blue: 0.39, alpha: 1)
+        optimizeToolbarButton?.setAccessibilityLabel(enabled ? "关闭小红书优化" : "开启小红书优化")
+    }
+
+    @objc private func showActionMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let importItem = menu.addItem(withTitle: "导入照片…", action: #selector(openPhotos), keyEquivalent: "")
+        importItem.target = self
+        let clearItem = menu.addItem(withTitle: "清空照片", action: #selector(clearPhotos), keyEquivalent: "")
+        clearItem.target = self
+        clearItem.isEnabled = !photos.isEmpty
+        let folderItem = menu.addItem(withTitle: "选择导出文件夹…", action: #selector(chooseOutputFolder), keyEquivalent: "")
+        folderItem.target = self
+        folderItem.isEnabled = !photos.isEmpty
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
 
     private func select(_ url: URL) {
         guard let image = NSImage(contentsOf: url) else {
@@ -748,8 +1115,13 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         }
         selectedURL = url
         preview.image = image
+        fullscreenImage?.image = image
         selectedName.stringValue = url.lastPathComponent
         dimensions.stringValue = "\(Int(image.size.width)) × \(Int(image.size.height))"
+        for case let button as NSButton in thumbnailStack.arrangedSubviews {
+            updateThumbnailAppearance(button, selected: button.tag == photos.firstIndex(of: url))
+        }
+        if let index = photos.firstIndex(of: url) { centerThumbnail(at: index) }
     }
 
     private func importURLs(_ urls: [URL]) {
@@ -781,17 +1153,20 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
             var isDirectory: ObjCBool = false
             return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
         } ?? unique[0]
-        outputDirectory = source.deletingLastPathComponent().appendingPathComponent("Photoframe_output", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory)
+        let sourceFolder = isDirectory.boolValue ? source : source.deletingLastPathComponent()
+        outputDirectory = sourceFolder.deletingLastPathComponent()
+            .appendingPathComponent("\(sourceFolder.lastPathComponent)_photoframe", isDirectory: true)
         updateOutputPath()
-        table.reloadData()
-        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        countLabel.stringValue = "\(photos.count)"
-        exportButton.isEnabled = true
-        chooseFolderButton.isEnabled = true
-        statusLabel.stringValue = "每边宽度按照片短边计算"
+        selectedURL = nil
+        refreshThumbnails()
+        select(unique[0])
+        statusLabel.stringValue = ""
     }
 
     @objc private func clearPhotos() {
+        closeFullscreenPreview(animated: false)
         photos = []
         selectedURL = nil
         outputDirectory = nil
@@ -799,11 +1174,19 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         preview.image = nil
         selectedName.stringValue = "预览"
         dimensions.stringValue = ""
-        countLabel.stringValue = "0"
-        exportButton.isEnabled = false
-        chooseFolderButton.isEnabled = false
-        table.reloadData()
-        statusLabel.stringValue = "每边宽度按照片短边计算"
+        refreshThumbnails()
+        statusLabel.stringValue = ""
+    }
+
+    @objc private func deleteSelectedPhoto() {
+        guard let selectedURL, let index = photos.firstIndex(of: selectedURL) else { return }
+        photos.remove(at: index)
+        if photos.isEmpty {
+            clearPhotos()
+        } else {
+            select(photos[min(index, photos.count - 1)])
+            refreshThumbnails()
+        }
     }
 
     @objc private func borderChanged() {
@@ -828,10 +1211,22 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
 
     @objc private func borderInputCommitted() {
         applyBorder(enteredValue(in: borderInput, maximum: 30) ?? preview.borderPercent)
+        clearNumericInputFocusIfStillActive(borderInput)
     }
 
     @objc private func canvasInputCommitted() {
         applyCanvas(enteredValue(in: canvasInput, maximum: 50) ?? preview.canvasPercent)
+        clearNumericInputFocusIfStillActive(canvasInput)
+    }
+
+    private func clearNumericInputFocusIfStillActive(_ field: NSTextField) {
+        DispatchQueue.main.async { [weak self, weak field] in
+            guard let self, let field,
+                  let editor = field.currentEditor() as? NSTextView,
+                  self.window.firstResponder === editor else { return }
+            editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+            self.window.makeFirstResponder(self.window.contentView)
+        }
     }
 
     private func enteredValue(in field: NSTextField, maximum: Double) -> Double? {
@@ -844,35 +1239,123 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     private func applyBorder(_ value: Double, updateInput: Bool = true) {
         slider.doubleValue = value
         preview.borderPercent = value
+        fullscreenImage?.borderPercent = value
         if updateInput { borderInput.stringValue = String(value) }
         UserDefaults.standard.set(value, forKey: borderPreferenceKey)
     }
 
     @objc private func canvasChanged(_ sender: Any?) {
-        let enabled = canvasToggle.state == .on
         let value = sender as? NSSlider === canvasSlider
             ? (canvasSlider.doubleValue * 2).rounded() / 2 : canvasSlider.doubleValue
         applyCanvas(value)
-        canvasSlider.isEnabled = enabled
-        canvasInput.isEnabled = enabled
-        canvasRatioButton.isEnabled = enabled
-        optimizeToggle.isHidden = !enabled
-        preview.canvasEnabled = enabled
-        let ratio = CanvasRatio(rawValue: canvasRatioButton.titleOfSelectedItem ?? "") ?? .square
-        preview.canvasRatio = ratio
-        UserDefaults.standard.set(enabled, forKey: canvasEnabledPreferenceKey)
-        UserDefaults.standard.set(ratio.rawValue, forKey: canvasRatioPreferenceKey)
     }
 
     private func applyCanvas(_ value: Double, updateInput: Bool = true) {
         canvasSlider.doubleValue = value
         preview.canvasPercent = value
+        fullscreenImage?.canvasPercent = value
         if updateInput { canvasInput.stringValue = String(value) }
         UserDefaults.standard.set(value, forKey: canvasPreferenceKey)
     }
 
-    @objc private func optimizeChanged() {
-        UserDefaults.standard.set(optimizeToggle.state == .on, forKey: optimizePreferenceKey)
+    // The window stays on the active screen; only the rendered photo grows from its
+    // exact position in the editor. Keeping the overlay key also delivers space keyUp.
+    private func handlePreviewKey(_ event: NSEvent) -> NSEvent? {
+        if event.keyCode == 49 {
+            if event.type == .keyUp {
+                if fullscreenWindow != nil { closeFullscreenPreview(animated: true); return nil }
+            } else if event.type == .keyDown {
+                if fullscreenWindow != nil { return nil }
+                guard !event.isARepeat, selectedURL != nil,
+                      !(window.firstResponder is NSTextView) else { return event }
+                openFullscreenPreview()
+                return nil
+            }
+        }
+        guard event.type == .keyDown, fullscreenWindow != nil else { return event }
+        switch event.keyCode {
+        case 123: movePreviewSelection(by: -1); return nil
+        case 124: movePreviewSelection(by: 1); return nil
+        case 53: closeFullscreenPreview(animated: true); return nil
+        default: return event
+        }
+    }
+
+    private func movePreviewSelection(by offset: Int) {
+        guard let selectedURL, let index = photos.firstIndex(of: selectedURL), !photos.isEmpty else { return }
+        select(photos[(index + offset + photos.count) % photos.count])
+    }
+
+    private func openFullscreenPreview() {
+        guard let image = preview.image, let screen = window.screen else { return }
+        let overlay = FullscreenPreviewWindow(contentRect: screen.frame,
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        overlay.backgroundColor = .clear
+        overlay.isOpaque = false
+        overlay.hasShadow = false
+        overlay.level = .floating
+        overlay.collectionBehavior = [.fullScreenAuxiliary, .canJoinAllSpaces]
+        let root = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        root.wantsLayer = true
+        overlay.contentView = root
+        let backdrop = NSView(frame: root.bounds)
+        backdrop.autoresizingMask = [.width, .height]
+        backdrop.wantsLayer = true
+        backdrop.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
+        backdrop.alphaValue = 0
+        root.addSubview(backdrop)
+        let startRect = window.convertToScreen(preview.convert(preview.bounds, to: nil))
+        let source = overlay.convertFromScreen(startRect)
+        let expanded = root.bounds.insetBy(dx: 36, dy: 36)
+        let fullscreen = PreviewView(frame: source)
+        fullscreen.backgroundColor = .clear
+        fullscreen.image = image
+        fullscreen.borderPercent = preview.borderPercent
+        fullscreen.canvasPercent = preview.canvasPercent
+        fullscreen.canvasRatio = preview.canvasRatio
+        fullscreen.canvasEnabled = preview.canvasEnabled
+        root.addSubview(fullscreen)
+        previewSourceRect = source
+        fullscreenWindow = overlay
+        fullscreenImage = fullscreen
+        fullscreenBackdrop = backdrop
+        previewIsClosing = false
+        overlay.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.26
+            context.timingFunction = CAMediaTimingFunction(name: .linear)
+            fullscreen.animator().frame = expanded
+            backdrop.animator().alphaValue = 1
+        }
+    }
+
+    private func closeFullscreenPreview(animated: Bool) {
+        guard let overlay = fullscreenWindow else { return }
+        if previewIsClosing { return }
+        previewIsClosing = true
+        guard animated, let fullscreen = fullscreenImage, let backdrop = fullscreenBackdrop else {
+            overlay.orderOut(nil)
+            fullscreenWindow = nil
+            fullscreenImage = nil
+            fullscreenBackdrop = nil
+            previewIsClosing = false
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.26
+            context.timingFunction = CAMediaTimingFunction(name: .linear)
+            fullscreen.animator().frame = previewSourceRect
+            backdrop.animator().alphaValue = 0
+        } completionHandler: { [weak self, weak overlay] in
+            guard let self, let overlay, self.fullscreenWindow === overlay else { return }
+            overlay.orderOut(nil)
+            self.fullscreenWindow = nil
+            self.fullscreenImage = nil
+            self.fullscreenBackdrop = nil
+            self.previewIsClosing = false
+            self.window.makeKeyAndOrderFront(nil)
+        }
     }
 
     private func updateOutputPath() {
@@ -921,9 +1404,9 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         }
         var reserved: Set<String> = []
         let settings = FrameSettings(borderPercent: preview.borderPercent,
-            canvasEnabled: canvasToggle.state == .on, canvasPercent: canvasSlider.doubleValue,
+            canvasEnabled: true, canvasPercent: canvasSlider.doubleValue,
             canvasRatio: preview.canvasRatio,
-            optimizeForXiaohongshu: optimizeToggle.state == .on)
+            optimizeForXiaohongshu: optimizeForXiaohongshu)
         let jobs = photos.map { source in
             (source, uniqueDestination(in: folder, for: source, optimized: settings.optimized, reserved: &reserved))
         }
@@ -931,7 +1414,7 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
     }
 
     private func uniqueDestination(in folder: URL, for source: URL, optimized: Bool, reserved: inout Set<String>) -> URL {
-        let name = source.deletingPathExtension().lastPathComponent + "_framed"
+        let name = source.deletingPathExtension().lastPathComponent + "_photoframe"
         let ext = optimized ? "jpg" : ExportFormat(source: source).fileExtension
         var result = folder.appendingPathComponent("\(name).\(ext)")
         var number = 2
@@ -981,10 +1464,12 @@ private final class AppController: NSObject, NSApplicationDelegate, NSTableViewD
         effect.autoresizingMask = [.width, .height]
         root.addSubview(effect, positioned: .above, relativeTo: nil)
         confettiView = effect
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak effect] in
+        effect.layoutSubtreeIfNeeded()
+        effect.burst()
+        DispatchQueue.main.asyncAfter(deadline: .now() + ConfettiView.burstDuration) { [weak effect] in
             effect?.stop()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self, weak effect] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.3) { [weak self, weak effect] in
             guard let self, self.confettiView === effect else { return }
             effect?.removeFromSuperview()
             self.confettiView = nil

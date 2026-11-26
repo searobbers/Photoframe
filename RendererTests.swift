@@ -9,7 +9,7 @@ func runRendererTests() throws {
         app.setActivationPolicy(.regular)
         let window = NSWindow(contentRect: CGRect(x: 200, y: 150, width: 980, height: 650),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "彩带动画预览"
+        window.title = "烟花动画预览"
         let background = NSView(frame: window.contentView!.bounds)
         background.wantsLayer = true
         background.layer?.backgroundColor = NSColor(calibratedWhite: 0.9, alpha: 1).cgColor
@@ -17,6 +17,11 @@ func runRendererTests() throws {
         let effect = ConfettiView(frame: background.bounds)
         effect.autoresizingMask = [.width, .height]
         background.addSubview(effect)
+        effect.layoutSubtreeIfNeeded()
+        effect.burst()
+        DispatchQueue.main.asyncAfter(deadline: .now() + ConfettiView.burstDuration) { [weak effect] in
+            effect?.stop()
+        }
         window.makeKeyAndOrderFront(nil)
         app.activate(ignoringOtherApps: true)
         app.run()
@@ -111,7 +116,13 @@ func runRendererTests() throws {
     precondition(emitter?.emitterCells?.count == 6)
     precondition(emitter?.emitterShape == .point && emitter?.emitterMode == .points)
     precondition(emitter?.emitterPosition.y == 14)
-    precondition(emitter?.emitterCells?.allSatisfy { $0.emissionLongitude == .pi / 2 && $0.yAcceleration < 0 } == true)
+    precondition(emitter?.birthRate == 0)
+    precondition(ConfettiView.burstDuration == 0.1)
+    precondition(emitter?.emitterCells?.allSatisfy {
+        $0.emissionLongitude == .pi / 2 && $0.emissionRange == .pi / 3 && $0.yAcceleration < 0
+    } == true)
+    confetti.burst()
+    precondition(emitter?.birthRate == 1)
     confetti.stop()
     precondition(emitter?.birthRate == 0)
     print("Renderer tests passed: \(optimizedImage.width)x\(optimizedImage.height), \(fileSize) bytes")
